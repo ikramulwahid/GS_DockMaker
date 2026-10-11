@@ -101,76 +101,107 @@ export function extractTextLayerFromPageElement(
     'DIV',
   ]);
 
-  // Specific semantic selectors for target text elements
+  // Candidate selectors that represent coherent text units.
+  // Using explicit content blocks avoids fragmentation across nested inline formatting tokens (strong, em, code, mark).
   const textSelectors = [
-    'header span',
+    // Header elements
     'header h1',
-    'header div',
+    'header span',
+    // Running page headers (page 2+)
+    'div[class*="border-b"] > span',
+    // Heading elements (all levels)
+    'h1',
     'h2',
     'h3',
     'h4',
     'h5',
     'h6',
+    // Body paragraphs
     'p',
-    'li span',
+    // List items
+    'li',
+    // Table headers and cells
     'th',
     'td',
+    // Figure captions
     'figcaption',
+    // Footers
     'footer span',
+    // Formula equation numbers and explicit selectable tokens
     '[data-selectable-text]',
+    'span[class*="tabular-nums"]',
+    'div[class*="tabular-nums"]',
+    // Metadata card/badge elements and signature blocks
+    'div[class*="font-semibold text-slate-900"]',
+    'div[class*="text-slate-600"]',
+    'div[class*="text-slate-500"]',
   ];
 
-  const candidateNodes = Array.from(pageElement.querySelectorAll(textSelectors.join(', ')));
+  // Exclude elements inside KaTeX math rendering (which contains both visual spans and raw MathML)
+  // to prevent duplicated formula math tokens or garbled math syntax in the text layer.
+  const allNodes = Array.from(pageElement.querySelectorAll(textSelectors.join(', ')));
 
-  // Filter out any element that is an ancestor container of another candidate node
-  // Example: a <td> or <li> that has an inner <span> or <p> candidate
-  const leafCandidates = candidateNodes.filter((node) => {
+  const candidateNodes = allNodes.filter((node) => {
     const el = node as HTMLElement;
-    // Check if any other candidate node is a descendant of this node
-    const hasCandidateDescendant = candidateNodes.some(
-      (other) => other !== el && el.contains(other)
-    );
-    if (hasCandidateDescendant) {
+    // Skip if inside KaTeX rendered markup (except explicit equation numbers)
+    if (el.closest('.katex') || el.closest('.katex-display') || el.closest('math')) {
       return false;
     }
-
     // Skip hidden or collapsed elements
     if (el.offsetParent === null && el.offsetWidth === 0 && el.offsetHeight === 0) {
       return false;
     }
-
     return true;
   });
 
-  // Sort candidate elements by visual reading order: top-to-bottom, then left-to-right
-  leafCandidates.sort((a, b) => {
-    const rA = (a as HTMLElement).getBoundingClientRect();
-    const rB = (b as HTMLElement).getBoundingClientRect();
-    if (Math.abs(rA.top - rB.top) > 4) {
-      return rA.top - rB.top;
+  // Helper to extract direct text from an element without including text belonging to child candidate blocks
+  const getDirectText = (el: HTMLElement, blockChildren: HTMLElement[]): string => {
+    if (blockChildren.length === 0) {
+      return el.innerText || '';
     }
-    return rA.left - rB.left;
-  });
+    let direct = '';
+    el.childNodes.forEach((child) => {
+      if (child.nodeType === 3 /* Node.TEXT_NODE */) {
+        direct += child.textContent || '';
+      } else if (child.nodeType === 1 /* Node.ELEMENT_NODE */) {
+        const childEl = child as HTMLElement;
+        const hasBlock = blockChildren.some((cand) => childEl === cand || childEl.contains(cand));
+        if (!hasBlock) {
+          direct += childEl.innerText || childEl.textContent || '';
+        }
+      }
+    });
+    return direct.trim();
+  };
 
-  const seenPositions = new Set<string>();
+  interface ResolvedTextRun {
+    element: HTMLElement;
+    text: string;
+    xMm: number;
+    yMm: number;
+    fontSizePt: number;
+    isBold: boolean;
+  }
 
-  leafCandidates.forEach((node) => {
+  const resolvedRuns: ResolvedTextRun[] = [];
+
+  candidateNodes.forEach((node) => {
     const el = node as HTMLElement;
-    const rawText = el.innerText?.trim();
-    if (!rawText || rawText.length === 0) return;
+    const childCandidates = candidateNodes.filter(
+      (other) => other !== el && el.contains(other)
+    ) as HTMLElement[];
+
+    // Extract text that belongs directly to this element (not delegated to child candidate blocks)
+    const textContent = getDirectText(el, childCandidates);
+    if (!textContent || textContent.length === 0) return;
 
     // Sanitize non-printable control characters
-    const cleanText = rawText.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '').trim();
+    const cleanText = textContent.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '').trim();
     if (!cleanText) return;
 
     const rect = el.getBoundingClientRect();
     const xMm = Math.max(0, (rect.left - pageRect.left) * pxToMmh);
     const yMm = Math.max(0, (rect.top - pageRect.top) * pxToMmv);
-
-    // Coordinate deduplication key (within 0.5mm and text match)
-    const locKey = `${xMm.toFixed(0)}-${yMm.toFixed(0)}-${cleanText.slice(0, 24)}`;
-    if (seenPositions.has(locKey)) return;
-    seenPositions.add(locKey);
 
     // Compute approximate font size in pt: (px * 72 / 96)
     let fontSizePt = 10;
@@ -188,17 +219,43 @@ export function extractTextLayerFromPageElement(
       // Fallback defaults
     }
 
+    resolvedRuns.push({
+      element: el,
+      text: cleanText,
+      xMm,
+      yMm,
+      fontSizePt,
+      isBold,
+    });
+  });
+
+  // Sort candidate elements by visual reading order: top-to-bottom, then left-to-right
+  resolvedRuns.sort((a, b) => {
+    if (Math.abs(a.yMm - b.yMm) > 1.5) {
+      return a.yMm - b.yMm;
+    }
+    return a.xMm - b.xMm;
+  });
+
+  const seenPositions = new Set<string>();
+
+  resolvedRuns.forEach((run) => {
+    // High-precision deduplication key (0.01 mm) prevents adjacent cells or identical labels from colliding
+    const locKey = `${run.xMm.toFixed(2)}_${run.yMm.toFixed(2)}_${run.text.slice(0, 32)}`;
+    if (seenPositions.has(locKey)) return;
+    seenPositions.add(locKey);
+
     // Normalizing text: split multi-line blocks so each line has reasonable vertical registration
-    const lines = cleanText.split('\n').map((l) => l.trim()).filter(Boolean);
-    const lineSpacingMm = fontSizePt * 0.352778 * 1.25; // 1 pt = 0.352778 mm
+    const lines = run.text.split('\n').map((l) => l.trim()).filter(Boolean);
+    const lineSpacingMm = run.fontSizePt * 0.352778 * 1.25; // 1 pt = 0.352778 mm
 
     lines.forEach((line, lineIdx) => {
       snippets.push({
         text: line,
-        xMm,
-        yMm: yMm + lineIdx * lineSpacingMm + fontSizePt * 0.35, // Adjust slightly down to baseline
-        fontSizePt,
-        isBold,
+        xMm: run.xMm,
+        yMm: run.yMm + lineIdx * lineSpacingMm + run.fontSizePt * 0.35, // Adjust slightly down to baseline
+        fontSizePt: run.fontSizePt,
+        isBold: run.isBold,
       });
     });
   });

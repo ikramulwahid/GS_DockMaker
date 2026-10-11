@@ -197,7 +197,10 @@ export function PreviewBlockRenderer({ block, subRange, displayNumber }: Preview
             dangerouslySetInnerHTML={{ __html: renderedMath }}
           />
           {formula.equationNumber && (
-            <span className="text-[11px] font-mono tabular-nums text-slate-500 shrink-0 pl-2">
+            <span
+              data-selectable-text
+              className="text-[11px] font-mono tabular-nums text-slate-500 shrink-0 pl-2"
+            >
               ({formula.equationNumber})
             </span>
           )}
