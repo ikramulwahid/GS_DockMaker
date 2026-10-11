@@ -1,4 +1,4 @@
-import jsPDF from 'jspdf';
+import { jsPDF } from 'jspdf';
 import { toCanvas } from 'html-to-image';
 import { DocumentModel } from '../types/document';
 import { getPageDimensions, PageDimensions } from '../utils/pageGeometry';

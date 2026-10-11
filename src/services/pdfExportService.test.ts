@@ -6,6 +6,7 @@ import { execSync } from 'child_process';
 import { getPageDimensions } from '../utils/pageGeometry';
 import { calculateDocumentPagination } from '../utils/paginationEngine';
 import { DocumentModel, DocumentBlockItem } from '../types/document';
+import { exportDocumentToPdf } from './pdfExportService';
 
 describe('PDF Export Engine & Geometry Verification', () => {
   it('correctly calculates physical A4 Portrait dimensions and margins', () => {
@@ -321,8 +322,11 @@ describe('Step 14A.3R Exact-Occurrence Assertions (Ghostscript PDF Extraction)',
     renderingMode: 'invisible',
   });
 
-  // F. Character Coverage: Degree symbol and labels
-  pdf.text('Thermal threshold reached at 37.5°C in laboratory conditions.', 25.4, 165, {
+  // F. Character Coverage: Degree symbol, Greek letters, and Rupee symbol
+  pdf.text('Thermal threshold reached at 37.5°C in laboratory conditions.', 25.4, 160, {
+    renderingMode: 'invisible',
+  });
+  pdf.text('Greek and rupee samples: α, β, γ and ₹45,000', 25.4, 170, {
     renderingMode: 'invisible',
   });
 
@@ -451,13 +455,33 @@ describe('Step 14A.3R Exact-Occurrence Assertions (Ghostscript PDF Extraction)',
     assert.ok(!page2Text.includes(page1Header), 'Page 1 header must not leak into Page 2');
   });
 
-  it('F. Character Coverage: degree symbol is extracted and non-Latin1 symbols are documented', () => {
+  it('F. Character Coverage: degree symbol extracts successfully; Greek and rupee symbols fail exact match', () => {
     const degreeTarget = '37.5°C';
     const count = countOccurrences(gsRawOutput, degreeTarget);
     assert.equal(
       count,
       1,
       `Degree symbol in "${degreeTarget}" must be extracted cleanly from PDF, got ${count}`
+    );
+
+    // Exact expected Unicode strings comparison
+    const expectedGreek = 'α, β, γ';
+    const expectedRupee = '₹';
+
+    const hasGreekExact = gsRawOutput.includes(expectedGreek);
+    const hasRupeeExact = gsRawOutput.includes(expectedRupee);
+
+    // Greek letters and Rupee symbol are not supported by standard Helvetica WinAnsiEncoding
+    // and fail exact match against their Unicode strings
+    assert.equal(
+      hasGreekExact,
+      false,
+      'Greek letters α, β, γ do not match exact Unicode string in standard WinAnsi text layer (extract as Latin-1 ±, ², ³)'
+    );
+    assert.equal(
+      hasRupeeExact,
+      false,
+      'Rupee symbol ₹ does not match exact Unicode string in standard WinAnsi text layer (extracts as Latin-1 ¹)'
     );
   });
 
@@ -495,5 +519,38 @@ describe('Export Reliability & Failure Handling', () => {
     const pages = calculateDocumentPagination(emptyDoc.blocks, dims);
     assert.equal(pages.length, 1);
     assert.equal(pages[0].blocks.length, 0);
+  });
+
+  it('aborts export and throws descriptive error if rendered page element is missing from DOM', async () => {
+    (globalThis as any).window = {
+      document: {
+        getElementById: () => null,
+      },
+    };
+
+    const sampleDoc: DocumentModel = {
+      metadata: {
+        title: 'Missing Page Test',
+        author: 'QA',
+        date: '2026-10-11',
+        documentType: 'report',
+        pageSize: 'A4',
+        pageOrientation: 'Portrait',
+        pageMargins: 'Standard',
+      },
+      blocks: [
+        { id: 'b1', type: 'paragraph', text: 'Sample paragraph' },
+      ],
+    };
+
+    await assert.rejects(
+      async () => {
+        await exportDocumentToPdf(sampleDoc);
+      },
+      {
+        name: 'Error',
+        message: /PDF Export Failed: Rendered element for page 1 \(#document-page-1\) was not found in the DOM/,
+      }
+    );
   });
 });
