@@ -17,39 +17,77 @@ const FALLBACK_IMAGE_PLACEHOLDER =
 
 /**
  * Robustly waits for all page dependencies (fonts, images, formulas, layout stability)
- * instead of arbitrary fixed timeouts.
+ * with explicit bounded failure handling.
  */
-async function waitForPageResourcesReady(containerEl: HTMLElement): Promise<void> {
-  // 1. Await document fonts ready if supported by the browser
-  if (typeof window !== 'undefined' && 'fonts' in window.document) {
+export async function waitForPageResourcesReady(
+  containerEl: HTMLElement,
+  timeoutMs: number = 2500
+): Promise<void> {
+  // 1. Await document fonts ready if supported by the browser with bounded failure timeout
+  if (typeof window !== 'undefined' && window.document && 'fonts' in window.document) {
     try {
-      await (window.document as unknown as { fonts: { ready: Promise<void> } }).fonts.ready;
+      const fontsPromise = (window.document as unknown as { fonts: { ready: Promise<void> } }).fonts.ready;
+      const fontTimeoutPromise = new Promise<void>((resolve) => setTimeout(resolve, timeoutMs));
+      await Promise.race([fontsPromise, fontTimeoutPromise]);
     } catch (e) {
       console.warn('Font readiness wait encountered minor issue:', e);
     }
   }
 
-  // 2. Await all images within containerEl to complete loading or erroring
+  // 2. Await all images within containerEl to complete loading and decoding or handle errors
   const images = Array.from(containerEl.querySelectorAll('img'));
   if (images.length > 0) {
-    const imagePromises = images.map((img) => {
-      if (img.complete) return Promise.resolve();
-      return new Promise<void>((resolve) => {
-        img.addEventListener('load', () => resolve(), { once: true });
-        img.addEventListener('error', () => resolve(), { once: true });
-        // Timeout guarantee per image: 2.5 seconds max
-        setTimeout(resolve, 2500);
+    const imagePromises = images.map(async (img) => {
+      if (img.complete) {
+        if ('decode' in img && typeof img.decode === 'function') {
+          try {
+            await img.decode();
+          } catch {
+            // Explicit error policy: continue if decoding fails for corrupted or cross-origin images
+          }
+        }
+        return;
+      }
+
+      await new Promise<void>((resolve) => {
+        let settled = false;
+        const done = () => {
+          if (!settled) {
+            settled = true;
+            resolve();
+          }
+        };
+
+        img.addEventListener(
+          'load',
+          async () => {
+            if ('decode' in img && typeof img.decode === 'function') {
+              try {
+                await img.decode();
+              } catch {
+                // Explicit error policy handled
+              }
+            }
+            done();
+          },
+          { once: true }
+        );
+
+        img.addEventListener('error', () => done(), { once: true });
+        setTimeout(done, timeoutMs);
       });
     });
     await Promise.all(imagePromises);
   }
 
   // 3. Double requestAnimationFrame to ensure layout reflow and rendering pipeline are flush
-  await new Promise<void>((resolve) => {
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => resolve());
+  if (typeof requestAnimationFrame !== 'undefined') {
+    await new Promise<void>((resolve) => {
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => resolve());
+      });
     });
-  });
+  }
 }
 
 /**

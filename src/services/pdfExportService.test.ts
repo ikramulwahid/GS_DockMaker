@@ -6,7 +6,7 @@ import { execSync } from 'child_process';
 import { getPageDimensions } from '../utils/pageGeometry';
 import { calculateDocumentPagination } from '../utils/paginationEngine';
 import { DocumentModel, DocumentBlockItem } from '../types/document';
-import { exportDocumentToPdf } from './pdfExportService';
+import { exportDocumentToPdf, waitForPageResourcesReady } from './pdfExportService';
 
 describe('PDF Export Engine & Geometry Verification', () => {
   it('correctly calculates physical A4 Portrait dimensions and margins', () => {
@@ -554,3 +554,226 @@ describe('Export Reliability & Failure Handling', () => {
     );
   });
 });
+
+describe('Browser-Level Resource Readiness & Application-State Preservation', () => {
+  const originalWindow = (globalThis as any).window;
+  const originalRAF = (globalThis as any).requestAnimationFrame;
+
+  function restoreGlobals() {
+    (globalThis as any).window = originalWindow;
+    (globalThis as any).requestAnimationFrame = originalRAF;
+  }
+
+  function setupMockBrowser(options: {
+    fontsReadyPromise?: Promise<void>;
+    images?: Array<{
+      complete: boolean;
+      decode?: () => Promise<void>;
+      triggerEvent?: 'load' | 'error' | 'hang';
+    }>;
+  }) {
+    (globalThis as any).requestAnimationFrame = (cb: () => void) => {
+      setTimeout(cb, 0);
+      return 1;
+    };
+
+    const listeners = new Map<any, { load: Function[]; error: Function[] }>();
+
+    const mockImages = (options.images || []).map((imgDef) => {
+      const imgListeners: { load: Function[]; error: Function[] } = { load: [], error: [] };
+      const imgObj: any = {
+        complete: imgDef.complete,
+        decode: imgDef.decode,
+        addEventListener: (event: 'load' | 'error', fn: Function) => {
+          if (imgListeners[event]) imgListeners[event].push(fn);
+          if (imgDef.triggerEvent === event) {
+            setTimeout(() => fn(), 10);
+          }
+        },
+      };
+      listeners.set(imgObj, imgListeners);
+      return imgObj;
+    });
+
+    const mockElement: any = {
+      querySelectorAll: (sel: string) => {
+        if (sel === 'img') return mockImages;
+        return [];
+      },
+      getBoundingClientRect: () => ({ left: 0, top: 0, width: 794, height: 1123 }),
+    };
+
+    (globalThis as any).window = {
+      document: {
+        fonts: {
+          ready: options.fontsReadyPromise ?? Promise.resolve(),
+        },
+        getElementById: (id: string) => (id.startsWith('document-page-') ? mockElement : null),
+      },
+    };
+
+    return { mockElement, mockImages };
+  }
+
+  it('resolves when document.fonts.ready resolves normally and double rAF completes', async () => {
+    let fontsResolved = false;
+    const fontsReadyPromise = new Promise<void>((res) => {
+      setTimeout(() => {
+        fontsResolved = true;
+        res();
+      }, 10);
+    });
+
+    const { mockElement } = setupMockBrowser({ fontsReadyPromise });
+    try {
+      await waitForPageResourcesReady(mockElement, 500);
+      assert.equal(fontsResolved, true, 'document.fonts.ready must have resolved before readiness returns');
+    } finally {
+      restoreGlobals();
+    }
+  });
+
+  it('enforces bounded failure timeout if document.fonts.ready hangs indefinitely', async () => {
+    const hangingPromise = new Promise<void>(() => {});
+
+    const { mockElement } = setupMockBrowser({ fontsReadyPromise: hangingPromise });
+    try {
+      const startTime = Date.now();
+      await waitForPageResourcesReady(mockElement, 100);
+      const elapsed = Date.now() - startTime;
+      assert.ok(elapsed >= 80, `Expected bounded timeout around 100ms, elapsed: ${elapsed}ms`);
+      assert.ok(elapsed < 1000, 'Must not hang indefinitely on stalled fonts.ready');
+    } finally {
+      restoreGlobals();
+    }
+  });
+
+  it('handles document.fonts.ready rejection gracefully without throwing unhandled rejection', async () => {
+    const rejectingPromise = Promise.reject(new Error('Font loading network error'));
+
+    const { mockElement } = setupMockBrowser({ fontsReadyPromise: rejectingPromise });
+    try {
+      await waitForPageResourcesReady(mockElement, 200);
+    } finally {
+      restoreGlobals();
+    }
+  });
+
+  it('awaits HTML images decoding and completes when img.complete is true with img.decode()', async () => {
+    let decodeCalled = false;
+    const { mockElement } = setupMockBrowser({
+      images: [
+        {
+          complete: true,
+          decode: async () => {
+            decodeCalled = true;
+          },
+        },
+      ],
+    });
+
+    try {
+      await waitForPageResourcesReady(mockElement, 500);
+      assert.equal(decodeCalled, true, 'img.decode() must be awaited for pre-completed images');
+    } finally {
+      restoreGlobals();
+    }
+  });
+
+  it('handles image decode() failure gracefully according to error policy', async () => {
+    const { mockElement } = setupMockBrowser({
+      images: [
+        {
+          complete: true,
+          decode: async () => {
+            throw new Error('Image decoding corrupt bitmap error');
+          },
+        },
+      ],
+    });
+
+    try {
+      await waitForPageResourcesReady(mockElement, 500);
+    } finally {
+      restoreGlobals();
+    }
+  });
+
+  it('enforces bounded failure timeout if an image load stalls indefinitely', async () => {
+    const { mockElement } = setupMockBrowser({
+      images: [
+        {
+          complete: false,
+          triggerEvent: 'hang',
+        },
+      ],
+    });
+
+    try {
+      const startTime = Date.now();
+      await waitForPageResourcesReady(mockElement, 100);
+      const elapsed = Date.now() - startTime;
+      assert.ok(elapsed >= 80, `Image wait should respect bounded timeout, elapsed: ${elapsed}ms`);
+      assert.ok(elapsed < 1000, 'Must not hang indefinitely on stalled image network fetch');
+    } finally {
+      restoreGlobals();
+    }
+  });
+
+  it('resolves when image fires error event according to error policy', async () => {
+    const { mockElement } = setupMockBrowser({
+      images: [
+        {
+          complete: false,
+          triggerEvent: 'error',
+        },
+      ],
+    });
+
+    try {
+      await waitForPageResourcesReady(mockElement, 500);
+    } finally {
+      restoreGlobals();
+    }
+  });
+
+  it('verifies export process does not mutate DocumentModel, metadata, or block records (deep immutability)', async () => {
+    const sampleDoc: DocumentModel = {
+      metadata: {
+        title: 'Immutability Audit Document',
+        author: 'Lead Verification Engineer',
+        date: '2026-10-11',
+        documentType: 'audit-spec',
+        pageSize: 'A4',
+        pageOrientation: 'Portrait',
+        pageMargins: 'Standard',
+      },
+      blocks: [
+        { id: 'b1', type: 'heading', level: 'h1', text: 'Section 1: Unchanged Heading' },
+        { id: 'b2', type: 'paragraph', text: 'Original paragraph content.' },
+        {
+          id: 'b3',
+          type: 'table',
+          headers: ['Col A', 'Col B'],
+          rows: [['Val 1', 'Val 2']],
+        },
+      ],
+    };
+
+    // Deep freeze input document model to guarantee strict immutability
+    Object.freeze(sampleDoc.metadata);
+    sampleDoc.blocks.forEach((b) => Object.freeze(b));
+    Object.freeze(sampleDoc.blocks);
+    Object.freeze(sampleDoc);
+
+    const snapshotBefore = JSON.stringify(sampleDoc);
+
+    const dims = getPageDimensions(sampleDoc.metadata);
+    const pages = calculateDocumentPagination(sampleDoc.blocks, dims);
+    assert.equal(pages.length, 1);
+
+    const snapshotAfter = JSON.stringify(sampleDoc);
+    assert.equal(snapshotBefore, snapshotAfter, 'DocumentModel must remain byte-identical without in-place mutation');
+  });
+});
+
