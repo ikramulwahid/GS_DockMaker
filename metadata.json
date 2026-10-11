@@ -1,0 +1,6 @@
+{
+  "name": "Document Studio",
+  "description": "Minimalist, professional block-based document builder and live A4 preview workspace.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
