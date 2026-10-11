@@ -1,8 +1,8 @@
 import jsPDF from 'jspdf';
 import { toCanvas } from 'html-to-image';
 import { DocumentModel } from '../types/document';
-import { getPageDimensions } from '../utils/pageGeometry';
-import { calculateDocumentPagination } from '../utils/paginationEngine';
+import { getPageDimensions, PageDimensions } from '../utils/pageGeometry';
+import { calculateDocumentPagination, DocumentPageLayout } from '../utils/paginationEngine';
 import { sanitizeFilename } from './documentSerializer';
 
 export interface PdfExportOptions {
@@ -16,18 +16,212 @@ const FALLBACK_IMAGE_PLACEHOLDER =
   'data:image/svg+xml;charset=utf-8,<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" fill="%23f1f5f9"/>';
 
 /**
+ * Robustly waits for all page dependencies (fonts, images, formulas, layout stability)
+ * instead of arbitrary fixed timeouts.
+ */
+async function waitForPageResourcesReady(containerEl: HTMLElement): Promise<void> {
+  // 1. Await document fonts ready if supported by the browser
+  if (typeof window !== 'undefined' && 'fonts' in window.document) {
+    try {
+      await (window.document as unknown as { fonts: { ready: Promise<void> } }).fonts.ready;
+    } catch (e) {
+      console.warn('Font readiness wait encountered minor issue:', e);
+    }
+  }
+
+  // 2. Await all images within containerEl to complete loading or erroring
+  const images = Array.from(containerEl.querySelectorAll('img'));
+  if (images.length > 0) {
+    const imagePromises = images.map((img) => {
+      if (img.complete) return Promise.resolve();
+      return new Promise<void>((resolve) => {
+        img.addEventListener('load', () => resolve(), { once: true });
+        img.addEventListener('error', () => resolve(), { once: true });
+        // Timeout guarantee per image: 2.5 seconds max
+        setTimeout(resolve, 2500);
+      });
+    });
+    await Promise.all(imagePromises);
+  }
+
+  // 3. Double requestAnimationFrame to ensure layout reflow and rendering pipeline are flush
+  await new Promise<void>((resolve) => {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => resolve());
+    });
+  });
+}
+
+/**
+ * Extracts visible text elements with relative page coordinates (in millimeters)
+ * from the rendered document page DOM.
+ * This enables rendering an invisible text layer directly inside jsPDF,
+ * transforming the raster visual layout into a fully searchable, selectable PDF.
+ */
+export interface TextSnippet {
+  text: string;
+  xMm: number;
+  yMm: number;
+  fontSizePt: number;
+  isBold: boolean;
+}
+
+/**
+ * Extracts visible text elements with relative page coordinates (in millimeters)
+ * from the rendered document page DOM.
+ * Enforces a strict leaf-ownership rule so that structural parent containers
+ * (e.g. li, th, td, header, figcaption) never duplicate the text runs owned
+ * by their inner content children.
+ */
+export function extractTextLayerFromPageElement(
+  pageElement: HTMLElement,
+  dimensions: PageDimensions
+): TextSnippet[] {
+  const snippets: TextSnippet[] = [];
+  const pageRect = pageElement.getBoundingClientRect();
+  if (pageRect.width <= 0 || pageRect.height <= 0) return snippets;
+
+  // Conversion factors from DOM pixels to PDF millimeters
+  const pxToMmh = dimensions.widthMm / pageRect.width;
+  const pxToMmv = dimensions.heightMm / pageRect.height;
+
+  // Structural parent tags whose text is delegated to child text blocks
+  const STRUCTURAL_PARENT_TAGS = new Set([
+    'HEADER',
+    'FOOTER',
+    'LI',
+    'TH',
+    'TD',
+    'TABLE',
+    'THEAD',
+    'TBODY',
+    'TR',
+    'FIGURE',
+    'ARTICLE',
+    'DIV',
+  ]);
+
+  // Specific semantic selectors for target text elements
+  const textSelectors = [
+    'header span',
+    'header h1',
+    'header div',
+    'h2',
+    'h3',
+    'h4',
+    'h5',
+    'h6',
+    'p',
+    'li span',
+    'th',
+    'td',
+    'figcaption',
+    'footer span',
+    '[data-selectable-text]',
+  ];
+
+  const candidateNodes = Array.from(pageElement.querySelectorAll(textSelectors.join(', ')));
+
+  // Filter out any element that is an ancestor container of another candidate node
+  // Example: a <td> or <li> that has an inner <span> or <p> candidate
+  const leafCandidates = candidateNodes.filter((node) => {
+    const el = node as HTMLElement;
+    // Check if any other candidate node is a descendant of this node
+    const hasCandidateDescendant = candidateNodes.some(
+      (other) => other !== el && el.contains(other)
+    );
+    if (hasCandidateDescendant) {
+      return false;
+    }
+
+    // Skip hidden or collapsed elements
+    if (el.offsetParent === null && el.offsetWidth === 0 && el.offsetHeight === 0) {
+      return false;
+    }
+
+    return true;
+  });
+
+  // Sort candidate elements by visual reading order: top-to-bottom, then left-to-right
+  leafCandidates.sort((a, b) => {
+    const rA = (a as HTMLElement).getBoundingClientRect();
+    const rB = (b as HTMLElement).getBoundingClientRect();
+    if (Math.abs(rA.top - rB.top) > 4) {
+      return rA.top - rB.top;
+    }
+    return rA.left - rB.left;
+  });
+
+  const seenPositions = new Set<string>();
+
+  leafCandidates.forEach((node) => {
+    const el = node as HTMLElement;
+    const rawText = el.innerText?.trim();
+    if (!rawText || rawText.length === 0) return;
+
+    // Sanitize non-printable control characters
+    const cleanText = rawText.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '').trim();
+    if (!cleanText) return;
+
+    const rect = el.getBoundingClientRect();
+    const xMm = Math.max(0, (rect.left - pageRect.left) * pxToMmh);
+    const yMm = Math.max(0, (rect.top - pageRect.top) * pxToMmv);
+
+    // Coordinate deduplication key (within 0.5mm and text match)
+    const locKey = `${xMm.toFixed(0)}-${yMm.toFixed(0)}-${cleanText.slice(0, 24)}`;
+    if (seenPositions.has(locKey)) return;
+    seenPositions.add(locKey);
+
+    // Compute approximate font size in pt: (px * 72 / 96)
+    let fontSizePt = 10;
+    let isBold = false;
+    try {
+      const computed = window.getComputedStyle(el);
+      const fontSizePx = parseFloat(computed.fontSize) || 12;
+      fontSizePt = Math.max(7, Math.min(24, Math.round(fontSizePx * (72 / 96))));
+      isBold =
+        computed.fontWeight === 'bold' ||
+        computed.fontWeight === '700' ||
+        computed.fontWeight === '600' ||
+        parseInt(computed.fontWeight, 10) >= 600;
+    } catch {
+      // Fallback defaults
+    }
+
+    // Normalizing text: split multi-line blocks so each line has reasonable vertical registration
+    const lines = cleanText.split('\n').map((l) => l.trim()).filter(Boolean);
+    const lineSpacingMm = fontSizePt * 0.352778 * 1.25; // 1 pt = 0.352778 mm
+
+    lines.forEach((line, lineIdx) => {
+      snippets.push({
+        text: line,
+        xMm,
+        yMm: yMm + lineIdx * lineSpacingMm + fontSizePt * 0.35, // Adjust slightly down to baseline
+        fontSizePt,
+        isBold,
+      });
+    });
+  });
+
+  return snippets;
+}
+
+/**
  * Generates and downloads a genuine, paginated PDF directly from the document model.
- * Uses exact physical dimensions (mm) matching authoritative page geometry,
- * faithfully preserving full layout, typography, KaTeX equations, tables, badges,
- * and page headers/footers in the generated PDF.
+ * Preserves high-fidelity appearance (margins, typography, KaTeX equations, tables, badges)
+ * and overlays an invisible text layer to make all text searchable and selectable.
  */
 export async function exportDocumentToPdf(
   document: DocumentModel,
   options?: PdfExportOptions
 ): Promise<void> {
   const dimensions = getPageDimensions(document.metadata);
-  const pages = calculateDocumentPagination(document.blocks, dimensions);
+  const pages: DocumentPageLayout[] = calculateDocumentPagination(document.blocks, dimensions);
   const totalPages = pages.length;
+
+  if (totalPages === 0) {
+    throw new Error('Cannot export empty document: No pages were generated by the pagination engine.');
+  }
 
   const isLandscape = dimensions.orientation === 'Landscape';
 
@@ -39,11 +233,18 @@ export async function exportDocumentToPdf(
     compress: true,
   });
 
+  // Embed document metadata properties into the PDF
+  pdf.setProperties({
+    title: document.metadata.title || 'Untitled Document',
+    author: document.metadata.author || '',
+    subject: document.metadata.documentType || 'Document',
+    creator: 'Document Studio',
+  });
+
   const pageWidthMm = dimensions.widthMm;
   const pageHeightMm = dimensions.heightMm;
 
-  // Allow brief tick for DOM and layout stability
-  await new Promise((resolve) => setTimeout(resolve, 80));
+  let successfulPageCount = 0;
 
   for (let pageIdx = 0; pageIdx < totalPages; pageIdx++) {
     const pageNum = pageIdx + 1;
@@ -54,20 +255,51 @@ export async function exportDocumentToPdf(
     // Locate the on-screen rendered page element in the DOM
     const pageElement = window.document.getElementById(`document-page-${pageNum}`);
 
-    if (pageElement) {
-      let canvas: HTMLCanvasElement | null = null;
+    if (!pageElement) {
+      throw new Error(
+        `PDF Export Failed: Rendered element for page ${pageNum} (#document-page-${pageNum}) was not found in the DOM. Ensure the Document Preview is open.`
+      );
+    }
 
+    // Await font readiness, KaTeX typesetting, and image decoding explicitly
+    await waitForPageResourcesReady(pageElement);
+
+    let canvas: HTMLCanvasElement | null = null;
+
+    try {
+      // Primary high-DPI rasterization via html-to-image (native SVG foreignObject pipeline)
+      canvas = await toCanvas(pageElement, {
+        pixelRatio: 2, // 2x scale (192 DPI) gives crisp, razor-sharp typography
+        backgroundColor: '#ffffff',
+        width: Math.round(dimensions.widthPx),
+        height: Math.round(dimensions.heightPx),
+        skipFonts: true, // Use already-loaded page fonts; avoids cross-origin CSS rule restrictions
+        imagePlaceholder: FALLBACK_IMAGE_PLACEHOLDER,
+        style: {
+          transform: 'none',
+          transformOrigin: 'top left',
+          boxShadow: 'none',
+          border: 'none',
+          borderRadius: '0px',
+          margin: '0',
+          width: `${Math.round(dimensions.widthPx)}px`,
+          height: `${Math.round(dimensions.heightPx)}px`,
+          maxWidth: `${Math.round(dimensions.widthPx)}px`,
+          maxHeight: `${Math.round(dimensions.heightPx)}px`,
+        },
+      });
+    } catch (renderError) {
+      console.warn(`Primary rasterization failed for page ${pageNum}, attempting image-safe retry:`, renderError);
+
+      // Safe retry filtering out potentially tainted cross-origin images
       try {
-        // High-DPI rasterization via html-to-image (native SVG foreignObject pipeline)
-        // Correctly renders modern CSS colors (oklab/oklch), web fonts, KaTeX math formulas,
-        // and exact margin padding without outdated CSS parser bugs.
         canvas = await toCanvas(pageElement, {
-          pixelRatio: 2, // 2x scale (192 DPI) gives crisp, razor-sharp typography
+          pixelRatio: 2,
           backgroundColor: '#ffffff',
           width: Math.round(dimensions.widthPx),
           height: Math.round(dimensions.heightPx),
-          skipFonts: true, // Use already-loaded page fonts; avoids cross-origin CSS rule restrictions
-          imagePlaceholder: FALLBACK_IMAGE_PLACEHOLDER,
+          skipFonts: true,
+          filter: (node) => node.tagName !== 'IMG',
           style: {
             transform: 'none',
             transformOrigin: 'top left',
@@ -77,51 +309,52 @@ export async function exportDocumentToPdf(
             margin: '0',
             width: `${Math.round(dimensions.widthPx)}px`,
             height: `${Math.round(dimensions.heightPx)}px`,
-            maxWidth: `${Math.round(dimensions.widthPx)}px`,
-            maxHeight: `${Math.round(dimensions.heightPx)}px`,
           },
         });
-      } catch (renderError) {
-        console.warn(`Primary rasterization failed for page ${pageNum}, attempting image-safe retry:`, renderError);
-
-        // Safe retry filtering out potentially tainted cross-origin images
-        try {
-          canvas = await toCanvas(pageElement, {
-            pixelRatio: 2,
-            backgroundColor: '#ffffff',
-            width: Math.round(dimensions.widthPx),
-            height: Math.round(dimensions.heightPx),
-            skipFonts: true,
-            filter: (node) => node.tagName !== 'IMG',
-            style: {
-              transform: 'none',
-              transformOrigin: 'top left',
-              boxShadow: 'none',
-              border: 'none',
-              borderRadius: '0px',
-              margin: '0',
-              width: `${Math.round(dimensions.widthPx)}px`,
-              height: `${Math.round(dimensions.heightPx)}px`,
-            },
-          });
-        } catch (retryError) {
-          console.error(`Page ${pageNum} export failure:`, retryError);
-        }
-      }
-
-      if (pageIdx > 0) {
-        pdf.addPage([dimensions.widthMm, dimensions.heightMm], isLandscape ? 'landscape' : 'portrait');
-      }
-
-      if (canvas) {
-        const imgData = canvas.toDataURL('image/jpeg', 0.95);
-        pdf.addImage(imgData, 'JPEG', 0, 0, pageWidthMm, pageHeightMm, undefined, 'FAST');
-      }
-    } else {
-      if (pageIdx > 0) {
-        pdf.addPage([dimensions.widthMm, dimensions.heightMm], isLandscape ? 'landscape' : 'portrait');
+      } catch (retryError) {
+        throw new Error(
+          `Page ${pageNum} export failure: Could not render page canvas (${retryError instanceof Error ? retryError.message : String(retryError)})`
+        );
       }
     }
+
+    if (!canvas) {
+      throw new Error(`Page ${pageNum} export failure: Canvas generation yielded null.`);
+    }
+
+    // Add page in jsPDF if beyond page 1
+    if (pageIdx > 0) {
+      pdf.addPage([dimensions.widthMm, dimensions.heightMm], isLandscape ? 'landscape' : 'portrait');
+    }
+
+    // 1. Draw high-fidelity raster canvas image
+    const imgData = canvas.toDataURL('image/jpeg', 0.95);
+    pdf.addImage(imgData, 'JPEG', 0, 0, pageWidthMm, pageHeightMm, undefined, 'FAST');
+
+    // 2. Extract and draw searchable, selectable text layer using invisible rendering mode
+    try {
+      const textSnippets = extractTextLayerFromPageElement(pageElement, dimensions);
+      for (const snippet of textSnippets) {
+        pdf.setFont('helvetica', snippet.isBold ? 'bold' : 'normal');
+        pdf.setFontSize(snippet.fontSizePt);
+        // renderingMode: 'invisible' injects the text into the PDF content stream (operator 3 Tr)
+        // so it can be selected, searched, and copied, perfectly aligned with the visual text underneath!
+        pdf.text(snippet.text, snippet.xMm, snippet.yMm, {
+          renderingMode: 'invisible',
+        });
+      }
+    } catch (textLayerError) {
+      console.warn(`Text layer extraction warning for page ${pageNum}:`, textLayerError);
+      // Non-fatal: if text extraction has an isolated issue on an unusual element, the visual page is still preserved
+    }
+
+    successfulPageCount++;
+  }
+
+  if (successfulPageCount !== totalPages) {
+    throw new Error(
+      `PDF Export Incomplete: Expected ${totalPages} pages but only rendered ${successfulPageCount}.`
+    );
   }
 
   // Trigger browser download with sanitized filename
